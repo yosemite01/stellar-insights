@@ -1,5 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,77 @@ use crate::database::Database;
 use crate::handlers::ApiResult;
 use crate::models::SortBy;
 use crate::rpc::StellarRpcClient;
+use crate::services::price_feed::PriceFeedClient;
+
+/// Represents an asset pair (source -> destination) for a corridor
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AssetPair {
+    source_asset: String,
+    destination_asset: String,
+}
+
+impl AssetPair {
+    fn to_corridor_key(&self) -> String {
+        format!("{}->{}", self.source_asset, self.destination_asset)
+    }
+}
+
+/// Extract asset pair from a payment operation
+/// Handles regular payments, path_payment_strict_send, and path_payment_strict_receive
+fn extract_asset_pair_from_payment(payment: &crate::rpc::Payment) -> Option<AssetPair> {
+    let operation_type = payment.operation_type.as_deref().unwrap_or("payment");
+
+    match operation_type {
+        "path_payment_strict_send" | "path_payment_strict_receive" => {
+            // Path payments have explicit source and destination assets
+            let source_asset = if let Some(src_type) = &payment.source_asset_type {
+                if src_type == "native" {
+                    "XLM:native".to_string()
+                } else {
+                    format!(
+                        "{}:{}",
+                        payment.source_asset_code.as_deref().unwrap_or("UNKNOWN"),
+                        payment.source_asset_issuer.as_deref().unwrap_or("unknown")
+                    )
+                }
+            } else {
+                return None;
+            };
+
+            let destination_asset = if payment.asset_type == "native" {
+                "XLM:native".to_string()
+            } else {
+                format!(
+                    "{}:{}",
+                    payment.asset_code.as_deref().unwrap_or("UNKNOWN"),
+                    payment.asset_issuer.as_deref().unwrap_or("unknown")
+                )
+            };
+
+            Some(AssetPair {
+                source_asset,
+                destination_asset,
+            })
+        }
+        "payment" | _ => {
+            // Regular payments: same asset for source and destination
+            let asset = if payment.asset_type == "native" {
+                "XLM:native".to_string()
+            } else {
+                format!(
+                    "{}:{}",
+                    payment.asset_code.as_deref().unwrap_or("UNKNOWN"),
+                    payment.asset_issuer.as_deref().unwrap_or("unknown")
+                )
+            };
+
+            Some(AssetPair {
+                source_asset: asset.clone(),
+                destination_asset: asset,
+            })
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CorridorResponse {
@@ -223,13 +296,15 @@ fn generate_corridor_list_cache_key(params: &ListCorridorsQuery) -> String {
     tag = "Corridors"
 )]
 pub async fn list_corridors(
-    State((_db, cache, rpc_client)): State<(
+    State((_db, cache, rpc_client, price_feed)): State<(
         Arc<Database>,
         Arc<CacheManager>,
         Arc<StellarRpcClient>,
+        Arc<PriceFeedClient>,
     )>,
     Query(params): Query<ListCorridorsQuery>,
-) -> ApiResult<Json<Vec<CorridorResponse>>> {
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let cache_key = generate_corridor_list_cache_key(&params);
 
     let corridors = <()>::get_or_fetch(
@@ -237,8 +312,9 @@ pub async fn list_corridors(
         &cache_key,
         cache.config.get_ttl("corridor"),
         async {
-            // **RPC DATA**: Fetch recent payments to identify active corridors
-            let payments = match rpc_client.fetch_payments(200, None).await {
+            // **RPC DATA**: Fetch recent payments with pagination to identify active corridors
+            // Use paginated fetch to get more complete data (up to configured limit)
+            let payments = match rpc_client.fetch_all_payments(Some(1000)).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!("Failed to fetch payments from RPC: {}", e);
@@ -246,8 +322,8 @@ pub async fn list_corridors(
                 }
             };
 
-            // **RPC DATA**: Fetch recent trades for volume data
-            let _trades = match rpc_client.fetch_trades(200, None).await {
+            // **RPC DATA**: Fetch recent trades with pagination for volume data
+            let _trades = match rpc_client.fetch_all_trades(Some(1000)).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Failed to fetch trades from RPC: {}", e);
@@ -260,20 +336,16 @@ pub async fn list_corridors(
             let mut corridor_map: HashMap<String, Vec<&crate::rpc::Payment>> = HashMap::new();
 
             for payment in &payments {
-                let asset_from = format!(
-                    "{}:{}",
-                    payment.asset_code.as_deref().unwrap_or("XLM"),
-                    payment.asset_issuer.as_deref().unwrap_or("native")
-                );
-
-                // For now, assume destination is XLM (we'd need more data to determine actual destination asset)
-                let asset_to = "XLM:native".to_string();
-
-                let corridor_key = format!("{}->{}", asset_from, asset_to);
-                corridor_map
-                    .entry(corridor_key)
-                    .or_insert_with(Vec::new)
-                    .push(payment);
+                // Extract the actual asset pair from the payment
+                if let Some(asset_pair) = extract_asset_pair_from_payment(payment) {
+                    let corridor_key = asset_pair.to_corridor_key();
+                    corridor_map
+                        .entry(corridor_key)
+                        .or_insert_with(Vec::new)
+                        .push(payment);
+                } else {
+                    tracing::warn!("Failed to extract asset pair from payment: {}", payment.id);
+                }
             }
 
             // Calculate metrics for each corridor
@@ -287,17 +359,6 @@ pub async fn list_corridors(
                 let failed_payments = 0;
                 let success_rate = if total_attempts > 0 { 100.0 } else { 0.0 };
 
-                // Calculate volume from payment amounts
-                let volume_usd: f64 = corridor_payments
-                    .iter()
-                    .filter_map(|p| p.amount.parse::<f64>().ok())
-                    .sum();
-
-                // Calculate health score
-                let health_score = calculate_health_score(success_rate, total_attempts, volume_usd);
-                let liquidity_trend = get_liquidity_trend(volume_usd);
-                let avg_latency = 400.0 + (success_rate * 2.0);
-
                 // Parse corridor key to get assets
                 let parts: Vec<&str> = corridor_key.split("->").collect();
                 if parts.len() != 2 {
@@ -310,6 +371,34 @@ pub async fn list_corridors(
                 if source_parts.len() != 2 || dest_parts.len() != 2 {
                     continue;
                 }
+
+                // Calculate volume from payment amounts and convert to USD
+                let mut volume_usd: f64 = 0.0;
+                let source_asset_key = parts[0];
+
+                // Get price for source asset
+                if let Ok(price) = price_feed.get_price(source_asset_key).await {
+                    for payment in corridor_payments.iter() {
+                        if let Ok(amount) = payment.amount.parse::<f64>() {
+                            volume_usd += amount * price;
+                        }
+                    }
+                } else {
+                    // Fallback: use raw amounts if price unavailable
+                    tracing::warn!(
+                        "Price unavailable for {}, using raw amounts",
+                        source_asset_key
+                    );
+                    volume_usd = corridor_payments
+                        .iter()
+                        .filter_map(|p| p.amount.parse::<f64>().ok())
+                        .sum();
+                }
+
+                // Calculate health score
+                let health_score = calculate_health_score(success_rate, total_attempts, volume_usd);
+                let liquidity_trend = get_liquidity_trend(volume_usd);
+                let avg_latency = 400.0 + (success_rate * 2.0);
 
                 let corridor_response = CorridorResponse {
                     id: corridor_key.clone(),
@@ -377,7 +466,9 @@ pub async fn list_corridors(
     )
     .await?;
 
-    Ok(Json(corridors))
+    let ttl = cache.config.get_ttl("corridor");
+    let response = crate::http_cache::cached_json_response(&headers, &cache_key, &corridors, ttl)?;
+    Ok(response)
 }
 
 /// Get detailed corridor information
@@ -399,10 +490,11 @@ pub async fn list_corridors(
     tag = "Corridors"
 )]
 pub async fn get_corridor_detail(
-    State((_db, _cache, _rpc_client)): State<(
+    State((_db, _cache, _rpc_client, _price_feed)): State<(
         Arc<Database>,
         Arc<CacheManager>,
         Arc<StellarRpcClient>,
+        Arc<PriceFeedClient>,
     )>,
     Path(_corridor_key): Path<String>,
 ) -> ApiResult<Json<CorridorDetailResponse>> {
@@ -427,5 +519,173 @@ mod tests {
         assert_eq!(get_liquidity_trend(15_000_000.0), "increasing");
         assert_eq!(get_liquidity_trend(5_000_000.0), "stable");
         assert_eq!(get_liquidity_trend(500_000.0), "decreasing");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_regular_payment_native() {
+        let payment = crate::rpc::Payment {
+            id: "test_1".to_string(),
+            paging_token: "token_1".to_string(),
+            transaction_hash: "hash_1".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "native".to_string(),
+            asset_code: None,
+            asset_issuer: None,
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: Some("payment".to_string()),
+            source_asset_type: None,
+            source_asset_code: None,
+            source_asset_issuer: None,
+            source_amount: None,
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "XLM:native");
+        assert_eq!(pair.destination_asset, "XLM:native");
+        assert_eq!(pair.to_corridor_key(), "XLM:native->XLM:native");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_regular_payment_issued_asset() {
+        let payment = crate::rpc::Payment {
+            id: "test_2".to_string(),
+            paging_token: "token_2".to_string(),
+            transaction_hash: "hash_2".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "credit_alphanum4".to_string(),
+            asset_code: Some("USDC".to_string()),
+            asset_issuer: Some("GISSUER".to_string()),
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: Some("payment".to_string()),
+            source_asset_type: None,
+            source_asset_code: None,
+            source_asset_issuer: None,
+            source_amount: None,
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "USDC:GISSUER");
+        assert_eq!(pair.destination_asset, "USDC:GISSUER");
+        assert_eq!(pair.to_corridor_key(), "USDC:GISSUER->USDC:GISSUER");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_path_payment_cross_asset() {
+        let payment = crate::rpc::Payment {
+            id: "test_3".to_string(),
+            paging_token: "token_3".to_string(),
+            transaction_hash: "hash_3".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "credit_alphanum4".to_string(),
+            asset_code: Some("EUR".to_string()),
+            asset_issuer: Some("GEURISSUER".to_string()),
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: Some("path_payment_strict_send".to_string()),
+            source_asset_type: Some("credit_alphanum4".to_string()),
+            source_asset_code: Some("USD".to_string()),
+            source_asset_issuer: Some("GUSDISSUER".to_string()),
+            source_amount: Some("105.0".to_string()),
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "USD:GUSDISSUER");
+        assert_eq!(pair.destination_asset, "EUR:GEURISSUER");
+        assert_eq!(pair.to_corridor_key(), "USD:GUSDISSUER->EUR:GEURISSUER");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_path_payment_native_to_issued() {
+        let payment = crate::rpc::Payment {
+            id: "test_4".to_string(),
+            paging_token: "token_4".to_string(),
+            transaction_hash: "hash_4".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "credit_alphanum4".to_string(),
+            asset_code: Some("USDC".to_string()),
+            asset_issuer: Some("GISSUER".to_string()),
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: Some("path_payment_strict_receive".to_string()),
+            source_asset_type: Some("native".to_string()),
+            source_asset_code: None,
+            source_asset_issuer: None,
+            source_amount: Some("150.0".to_string()),
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "XLM:native");
+        assert_eq!(pair.destination_asset, "USDC:GISSUER");
+        assert_eq!(pair.to_corridor_key(), "XLM:native->USDC:GISSUER");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_path_payment_issued_to_native() {
+        let payment = crate::rpc::Payment {
+            id: "test_5".to_string(),
+            paging_token: "token_5".to_string(),
+            transaction_hash: "hash_5".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "native".to_string(),
+            asset_code: None,
+            asset_issuer: None,
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: Some("path_payment_strict_send".to_string()),
+            source_asset_type: Some("credit_alphanum4".to_string()),
+            source_asset_code: Some("BRL".to_string()),
+            source_asset_issuer: Some("GBRLISSUER".to_string()),
+            source_amount: Some("500.0".to_string()),
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "BRL:GBRLISSUER");
+        assert_eq!(pair.destination_asset, "XLM:native");
+        assert_eq!(pair.to_corridor_key(), "BRL:GBRLISSUER->XLM:native");
+    }
+
+    #[test]
+    fn test_extract_asset_pair_missing_operation_type() {
+        // Should default to regular payment behavior
+        let payment = crate::rpc::Payment {
+            id: "test_6".to_string(),
+            paging_token: "token_6".to_string(),
+            transaction_hash: "hash_6".to_string(),
+            source_account: "GTEST".to_string(),
+            destination: "GDEST".to_string(),
+            asset_type: "credit_alphanum4".to_string(),
+            asset_code: Some("NGNT".to_string()),
+            asset_issuer: Some("GNGNTISSUER".to_string()),
+            amount: "100.0".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            operation_type: None,
+            source_asset_type: None,
+            source_asset_code: None,
+            source_asset_issuer: None,
+            source_amount: None,
+            from: Some("GTEST".to_string()),
+            to: Some("GDEST".to_string()),
+        };
+
+        let pair = extract_asset_pair_from_payment(&payment).unwrap();
+        assert_eq!(pair.source_asset, "NGNT:GNGNTISSUER");
+        assert_eq!(pair.destination_asset, "NGNT:GNGNTISSUER");
     }
 }

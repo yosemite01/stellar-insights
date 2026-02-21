@@ -2,10 +2,10 @@ use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Pool, Sqlite};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::models::{LiquidityPool, LiquidityPoolSnapshot, LiquidityPoolStats};
-use crate::rpc::{HorizonLiquidityPool, StellarRpcClient};
+use crate::rpc::StellarRpcClient;
 
 pub struct LiquidityPoolAnalyzer {
     pool: Pool<Sqlite>,
@@ -259,6 +259,8 @@ impl LiquidityPoolAnalyzer {
 
         Ok(LiquidityPoolStats {
             total_pools: row.0,
+            total_liquidity_usd: row.1,
+            avg_pool_size_usd: row.1 / row.0.max(1) as f64,
             total_value_locked_usd: row.1,
             total_volume_24h_usd: row.2,
             total_fees_24h_usd: row.3,

@@ -1,7 +1,7 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,7 @@ use crate::cache::{keys, CacheManager};
 use crate::cache_middleware::CacheAware;
 use crate::database::Database;
 use crate::rpc::StellarRpcClient;
+use crate::services::price_feed::PriceFeedClient;
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -125,13 +126,15 @@ pub struct AnchorsResponse {
     tag = "Anchors"
 )]
 pub async fn get_anchors(
-    State((db, cache, rpc_client)): State<(
+    State((db, cache, rpc_client, _price_feed)): State<(
         Arc<Database>,
         Arc<CacheManager>,
         Arc<StellarRpcClient>,
+        Arc<PriceFeedClient>,
     )>,
     Query(params): Query<ListAnchorsQuery>,
-) -> ApiResult<Json<AnchorsResponse>> {
+    headers: HeaderMap,
+) -> ApiResult<Response> {
     let cache_key = keys::anchor_list(params.limit, params.offset);
 
     let response = <()>::get_or_fetch(&cache, &cache_key, cache.config.get_ttl("anchor"), async {
@@ -146,9 +149,9 @@ pub async fn get_anchors(
             // Get asset count from database (metadata)
             let assets = db.get_assets_by_anchor(anchor_id).await?;
 
-            // **RPC DATA**: Fetch real-time payment data for this anchor
+            // **RPC DATA**: Fetch real-time payment data for this anchor with pagination
             let payments = match rpc_client
-                .fetch_account_payments(&anchor.stellar_account, 200)
+                .fetch_all_account_payments(&anchor.stellar_account, Some(500))
                 .await
             {
                 Ok(payments) => payments,
@@ -226,7 +229,9 @@ pub async fn get_anchors(
     })
     .await?;
 
-    Ok(Json(response))
+    let ttl = cache.config.get_ttl("anchor");
+    let response = crate::http_cache::cached_json_response(&headers, &cache_key, &response, ttl)?;
+    Ok(response)
 }
 
 #[cfg(test)]
