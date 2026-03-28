@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(unreachable_patterns)]
+extern crate std;
 
 mod errors;
 mod events;
