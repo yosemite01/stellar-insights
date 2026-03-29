@@ -1,4 +1,7 @@
 #![cfg(test)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::panic)]
 
 use super::*;
 use analytics::AnalyticsContractClient;
@@ -290,7 +293,7 @@ fn test_create_parameter_proposal() {
         &admin,
         &title,
         &target,
-        &ParameterAction::SetAdmin(new_admin),
+        &ParameterAction::SetAdmin(new_admin.clone()),
     );
     assert_eq!(proposal_id, 1);
 
